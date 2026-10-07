@@ -51,7 +51,17 @@ func (tx *Txn) Commit() (int, error) {
 	t := tx.table
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	var seq int
+	err := t.withTableLock(func() error {
+		var cerr error
+		seq, cerr = tx.commitLocked()
+		return cerr
+	})
+	return seq, err
+}
 
+func (tx *Txn) commitLocked() (int, error) {
+	t := tx.table
 	base, err := t.LoadSnapshot(tx.baseSeq)
 	if err != nil {
 		return 0, err
@@ -117,6 +127,7 @@ func (tx *Txn) Commit() (int, error) {
 		Parent:    tx.baseSeq,
 		Kind:      kind,
 		Keys:      keys,
+		RowCount:  t.nextRowCount(base, tx.rows),
 	}
 	if err := createExclusive(snapshotPath(t.dir, seq), snap); err != nil {
 		return 0, fmt.Errorf("%w: snapshot seq=%d already committed by another writer",
@@ -124,6 +135,44 @@ func (tx *Txn) Commit() (int, error) {
 	}
 	tx.committed = true
 	return seq, nil
+}
+
+// nextRowCount 计算提交后新快照的逻辑行数并物化，列历史时无需再扫数据。
+//   - 无主键（仅追加）表：行数直接为旧行数 + 本次写入行数；
+//   - 主键表：旧版本已有主键集合 ∪ 本次主键集合，只读取旧数据文件取键，
+//     不做整行合并（约数级别的开销，且结构演进提交沿用基线行数）。
+func (t *Table) nextRowCount(base *Snapshot, rows []Row) int {
+	if len(base.Schema.PrimaryKey) == 0 {
+		return base.RowCount + len(rows)
+	}
+	if len(rows) == 0 {
+		return base.RowCount
+	}
+	keys := make(map[string]bool, base.RowCount)
+	pk := base.Schema.PrimaryKey
+	for _, rel := range base.DataFiles {
+		_ = t.readDataFile(rel, func(r Row) {
+			keys[rowKey(pk, r)] = true
+		})
+	}
+	newKeys, err := primaryKeysOf(base.Schema, rows)
+	if err != nil {
+		// 主键缺失已在 upsert 校验阶段拦截；append 表走到这里时退化为全量计数
+		return t.countRowsFallback(base)
+	}
+	for _, k := range newKeys {
+		keys[k] = true
+	}
+	return len(keys)
+}
+
+// countRowsFallback 兜底：完整合并快照数据后计数。
+func (t *Table) countRowsFallback(base *Snapshot) int {
+	rows, err := t.scanSnapshot(base)
+	if err != nil {
+		return base.RowCount
+	}
+	return len(rows)
 }
 
 // checkKeyConflicts 检查 keys 是否与基线之后各 upsert 提交触碰的键重叠。
