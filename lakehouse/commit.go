@@ -21,12 +21,13 @@ import (
 
 // Txn 一次以快照为单位的写入事务。
 type Txn struct {
-	table     *Table
-	baseSeq   int
-	rows      []Row
-	upsert    bool
-	schema    *Schema // 非空表示同时提交结构演进
-	committed bool
+	table      *Table
+	baseSeq    int
+	rows       []Row
+	upsert     bool
+	schema     *Schema // 非空表示同时提交结构演进
+	rollbackTo int     // 非 0 表示本次提交是回滚到该历史快照
+	committed  bool
 }
 
 // Begin 基于当前快照开启事务。
@@ -45,6 +46,21 @@ func (tx *Txn) Upsert(rows ...Row) {
 
 // EvolveSchema 随本次提交进行结构演进（提交时做兼容校验）。
 func (tx *Txn) EvolveSchema(s Schema) { tx.schema = &s }
+
+// RollbackTo 使本次提交成为一次回滚：新快照内容（结构与数据文件清单）
+// 回到 seq 对应历史快照的状态。回滚是普通的前追加提交——历史快照不被
+// 改写，基线校验与普通提交一致：若 Begin 之后有其他提交抢先落盘，
+// 本次回滚以 ErrConflictConcurrentCommit 失败，不会盖住并发写入。
+// 回滚不能与 Append/Upsert/EvolveSchema 组合在同一事务中。
+func (tx *Txn) RollbackTo(seq int) { tx.rollbackTo = seq }
+
+// Rollback 把表回滚到历史快照 seq，返回新快照序号。
+// 等价于 Begin + RollbackTo + Commit；冲突时返回可归类错误。
+func (t *Table) Rollback(seq int) (int, error) {
+	tx := t.Begin()
+	tx.RollbackTo(seq)
+	return tx.Commit()
+}
 
 // Commit 提交事务，返回新快照序号；冲突时返回可归类错误。
 func (tx *Txn) Commit() (int, error) {
@@ -79,6 +95,33 @@ func (tx *Txn) Commit() (int, error) {
 	if stale {
 		return 0, fmt.Errorf("%w: base seq=%d, current seq=%d",
 			ErrConflictConcurrentCommit, tx.baseSeq, cur)
+	}
+
+	// 2.5 回滚提交：内容取自目标历史快照，不写新数据文件；
+	// 与写入/结构演进互斥。目标不存在时归因为 ErrSnapshotNotFound。
+	if tx.rollbackTo != 0 {
+		if len(tx.rows) > 0 || tx.schema != nil {
+			return 0, fmt.Errorf("lakehouse: rollback cannot be combined with writes or schema evolution")
+		}
+		target, err := t.LoadSnapshot(tx.rollbackTo)
+		if err != nil {
+			return 0, err
+		}
+		seq := tx.baseSeq + 1
+		snap := &Snapshot{
+			Seq:        seq,
+			Schema:     target.Schema,
+			DataFiles:  append([]string{}, target.DataFiles...),
+			Parent:     tx.baseSeq,
+			Kind:       "rollback",
+			RollbackTo: tx.rollbackTo,
+		}
+		if err := createExclusive(snapshotPath(t.dir, seq), snap); err != nil {
+			return 0, fmt.Errorf("%w: snapshot seq=%d already committed by another writer",
+				ErrConflictConcurrentCommit, seq)
+		}
+		tx.committed = true
+		return seq, nil
 	}
 
 	// 3. 结构演进校验（含存量数据收窄扫描）
@@ -117,6 +160,7 @@ func (tx *Txn) Commit() (int, error) {
 		Parent:    tx.baseSeq,
 		Kind:      kind,
 		Keys:      keys,
+		Rows:      len(tx.rows),
 	}
 	if err := createExclusive(snapshotPath(t.dir, seq), snap); err != nil {
 		return 0, fmt.Errorf("%w: snapshot seq=%d already committed by another writer",

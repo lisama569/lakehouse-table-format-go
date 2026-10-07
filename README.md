@@ -1,7 +1,8 @@
 # lakehouse-table-format-go
 
 用本地文件系统模拟存储层的迷你湖仓表格式，提供快照提交、结构演进、
-小文件合并与快照清理能力，保证并发写入与跨快照读取下表状态可预期。
+小文件合并、快照清理、历史清单、回滚与快照固定能力，保证并发写入
+与跨快照读取下表状态可预期。
 
 代码位于 `lakehouse/` 包。
 
@@ -10,7 +11,8 @@
 ```
 <dir>/
   data/part-XXXXXX-N.jsonl   数据文件（JSON Lines，行内按列 ID 存值）
-  snapshots/NNNNNN.json      快照清单（schema + 数据文件清单 + 父序号）
+  snapshots/NNNNNN.json      快照清单（schema + 数据文件清单 + 父序号 + 类别 + 行数）
+  pins.json                  被固定快照的序号清单（原子写）
 ```
 
 ## 快照与提交协议
@@ -51,13 +53,42 @@
   `ErrConflictConcurrentCommit` 失败，不会覆盖他人数据。
 - `Table.Cleanup(beforeSeq, retain)`：删除序号 `<= beforeSeq` 且不在
   最近 `retain` 个快照之内的快照文件；数据文件仅当不被任何存活快照
-  引用时才删除。会删掉被保留快照的越权请求、以及无可清理对象的过期
-  请求，都返回 `ErrCleanupRejected` 且不删除任何内容。
+  引用时才删除。**任何被拒绝的清理都是干净的：一个文件都不删**。
+  拒绝原因可归类（都能 `errors.Is` 匹配总类别 `ErrCleanupRejected`）：
+  - 仅 `ErrCleanupRejected`：越权——会删掉保留线之内的快照；
+  - `ErrCleanupNothing`：按当前规则没有任何可清理对象（请求过期）；
+  - `ErrCleanupPinned`：待删范围内包含被固定的快照（见下节）。
+
+## 历史清单与回滚
+
+- `Table.History(limit)` 按序号升序列出每次提交：类别（`kind`）、
+  父版本（`parent`）、涉及行数（`rows`，约值）、回滚目标（`rollback_to`）。
+  只读取快照元数据、**绝不扫描数据文件**，开销随提交次数增长而与
+  数据量无关；`limit > 0` 时只加载最近 limit 条，历史再长也扛得住。
+- `Table.Rollback(seq)` / `Txn.RollbackTo(seq)` 把表回滚到某个历史
+  快照：产生一个**新的前追加提交**（`kind=rollback`），内容（结构 +
+  数据文件清单）取自目标快照。已发生的历史快照及其读取结果**不被
+  改写或抹掉**。目标不存在时返回 `ErrSnapshotNotFound`，不产生提交。
+- 回滚与普通写入走**同一条乐观并发协议**：同一基线上回滚与写入
+  并发时恰有一方成功，失败方收到 `ErrConflictConcurrentCommit`——
+  不存在回滚盖住并发写入、或两笔都算数的情况。
+- 回滚不能与 Append/Upsert/EvolveSchema 组合在同一事务中（提交时拒绝）。
+
+## 快照固定（pin）
+
+- `Table.PinSnapshot(seq)` 固定快照，供长期对账/重放任务反复读取；
+  `Table.UnpinSnapshot(seq)` 解除固定；`Table.PinnedSnapshots()` 列出清单。
+- 结果可判定：固定不存在的快照返回 `ErrSnapshotNotFound`（不会当成功）；
+  解固未固定的快照返回 `ErrSnapshotNotPinned`；重复固定幂等成功。
+- 被固定的快照**不受保留窗口约束**：清理请求若覆盖到它，整体以
+  `ErrCleanupPinned` 拒绝且不删任何文件；合并只新增快照、从不删除，
+  天然不影响固定快照。解固后该快照恢复普通清理规则。
 
 ## 验证方法
 
 ```bash
-go test ./... -v
+go test ./... -v        # 全量单测
+go test ./... -race     # 并发竞态检测
 ```
 
 测试覆盖：
@@ -67,6 +98,13 @@ go test ./... -v
 - `schema_test.go`：新增列/重命名/收窄的跨快照读取语义，收窄溢出与
   各类不兼容演进在提交期被拒绝；
 - `compact_test.go`：合并去重保序、合并与并发写交错不丢不重、
-  清理保留线、越权/过期清理拒绝。
+  清理保留线、越权/过期清理拒绝；
+- `history_test.go`：历史清单的类别/父版本/行数与 limit 语义、
+  回滚恢复内容且不改写历史快照、回滚目标不存在归类、回滚与写入
+  互斥及并发竞争恰一胜、多路回滚/写入并发下序号连续且快照全部可读；
+- `pin_test.go`：固定/解固结果可判定（找不到/未固定各自归类）、
+  固定快照掉出保留窗口后清理被整体拒绝且零删除、解固后恢复可清理、
+  清理拒绝三分（越权/无对象/固定保护）互不混淆、
+  合并+清理+回滚+写入混合并发下最终状态可预期。
 
 单测日志通过 `t.Logf` 打印提交序号、快照标识与判定依据（"判定依据: ..."）。

@@ -46,6 +46,7 @@ func (t *Table) Compact() (int, error) {
 		DataFiles: files,
 		Parent:    baseSeq,
 		Kind:      "compact",
+		Rows:      len(rows),
 	}
 	if err := createExclusive(snapshotPath(t.dir, seq), snap); err != nil {
 		return 0, fmt.Errorf("%w: compact lost race at seq=%d",
@@ -55,15 +56,20 @@ func (t *Table) Compact() (int, error) {
 }
 
 // Cleanup 清理序号 <= beforeSeq 的旧快照及不再被引用的数据文件。
-// retain 表示必须保留的最近快照个数；若请求会删除被保留的快照，
-// 返回 ErrCleanupRejected 且不做任何删除。
+// retain 表示必须保留的最近快照个数。拒绝原因可归类（均可 errors.Is
+// 匹配 ErrCleanupRejected 这个总类别）：
+//   - ErrCleanupRejected（单独）：越权——会删掉保留线之内的快照；
+//   - ErrCleanupNothing：按当前规则没有任何可清理对象；
+//   - ErrCleanupPinned：待删范围内包含被 PinSnapshot 固定的快照。
+//
+// 任何被拒绝的清理都不删除任何文件，表保持完整可读。
 func (t *Table) Cleanup(beforeSeq int, retain int) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
 	seqs := t.listSnapshotSeqs()
 	if len(seqs) == 0 {
-		return fmt.Errorf("%w: table has no snapshots", ErrCleanupRejected)
+		return fmt.Errorf("%w: %w: table has no snapshots", ErrCleanupRejected, ErrCleanupNothing)
 	}
 	if retain < 1 {
 		retain = 1
@@ -86,7 +92,17 @@ func (t *Table) Cleanup(beforeSeq int, retain int) error {
 		}
 	}
 	if len(victims) == 0 {
-		return fmt.Errorf("%w: no snapshots at or before seq=%d", ErrCleanupRejected, beforeSeq)
+		return fmt.Errorf("%w: %w: no snapshots at or before seq=%d",
+			ErrCleanupRejected, ErrCleanupNothing, beforeSeq)
+	}
+
+	// 固定保护：待删范围内含被固定快照 => 整体拒绝，一个文件都不删
+	pinned := t.loadPins()
+	for _, s := range victims {
+		if pinned[s] {
+			return fmt.Errorf("%w: %w: seq=%d is pinned",
+				ErrCleanupRejected, ErrCleanupPinned, s)
+		}
 	}
 
 	// 收集存活快照引用的数据文件
